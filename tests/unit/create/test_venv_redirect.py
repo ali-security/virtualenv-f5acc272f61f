@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from stat import S_IREAD, S_IWRITE
 from typing import TYPE_CHECKING
 
@@ -134,16 +133,13 @@ def test_venv_redirect_forced_keeps_venv_folder(redirect: Path, caplog: pytest.L
     assert f"{redirect} keeps being the default environment" in caplog.text
 
 
-def test_venv_redirect_forced_not_write_able(redirect: Path, caplog: pytest.LogCaptureFixture) -> None:
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        pytest.skip("root may write read-only files")
+def test_venv_redirect_replaces_read_only_redirect(redirect: Path) -> None:
     _create(redirect.parent / "old", "--venv-redirect")
     redirect.write_text("old\n", encoding="utf-8")
     redirect.chmod(S_IREAD)
     try:
-        with caplog.at_level(logging.WARNING):
-            _create(redirect.parent / "env", "--venv-redirect")
+        _create(redirect.parent / "env", "--venv-redirect")
     finally:
         redirect.chmod(S_IREAD | S_IWRITE)
 
-    assert f"could not point {redirect.resolve()} at {(redirect.parent / 'env').resolve()}" in caplog.text
+    assert redirect.read_text(encoding="utf-8") == "env\n"
