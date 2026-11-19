@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import logging
+import os
+from base64 import urlsafe_b64encode
 from contextlib import contextmanager
+from importlib.metadata import distributions
 from pathlib import Path
 from shutil import copyfile
+from stat import S_IMODE
 from subprocess import Popen
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Final
 
 from virtualenv.seed.embed.base_embed import BaseEmbed
+from virtualenv.seed.embed.via_app_data.pip_install.base import shell_shebang
 from virtualenv.seed.wheels import Version, get_wheel, pip_wheel_env_run
+from virtualenv.util.path import write_file
 from virtualenv.util.subprocess import LogCmd
 
 if TYPE_CHECKING:
@@ -32,6 +41,43 @@ class PipInvoke(BaseEmbed):
         with self.get_pip_install_cmd(creator.exe, for_py_version) as cmd:
             env = pip_wheel_env_run(self.extra_search_dir, self.app_data, self.env)
             self._execute(cmd, env)
+        if os.name == "posix":
+            self._rewrite_launchers(creator)
+
+    def _rewrite_launchers(self, creator: Creator) -> None:
+        selected: Final = self.distribution_to_versions()
+        exe: Final = str(creator.exe).encode("utf-8")
+        for distribution in distributions(path=sorted({str(creator.purelib), str(creator.platlib)})):
+            if distribution.metadata["Name"].lower().replace("-", "_") not in selected:
+                continue
+            rows: Final = list(csv.reader(io.StringIO(distribution.read_text("RECORD") or "")))
+            changed = False
+            for row in rows:
+                path: Final = Path(os.path.abspath(str(distribution.locate_file(row[0]))))
+                if path.parent != creator.script_dir or not path.is_file():
+                    continue
+                content = path.read_bytes()
+                if content.startswith(b"#!/bin/sh\n'''exec' "):
+                    body = content.split(b"\n", 3)[3]
+                elif content.startswith(b"#!" + exe + b"\n") and len(exe.split()) > 1:
+                    body = content.split(b"\n", 1)[1]
+                else:
+                    continue
+                content = shell_shebang(str(creator.exe)) + body
+                mode: Final = S_IMODE(path.stat().st_mode) & 0o755
+                path.unlink()
+                with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "wb") as stream:
+                    stream.write(content)
+                row[1:] = [
+                    "sha256=" + urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode("ascii"),
+                    str(len(content)),
+                ]
+                changed = True
+            if changed:
+                record: Final = next(row[0] for row in rows if row[0].endswith(".dist-info/RECORD"))
+                buffer: Final = io.StringIO()
+                csv.writer(buffer).writerows(rows)
+                write_file(Path(str(distribution.locate_file(record))), buffer.getvalue().encode("utf-8"))
 
     @staticmethod
     def _execute(cmd: list[str], env: dict[str, str]) -> Popen[bytes]:
